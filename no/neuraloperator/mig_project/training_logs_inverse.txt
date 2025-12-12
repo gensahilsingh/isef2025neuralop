@@ -1,0 +1,22 @@
+(venv) wishi@QUANTUM:~/isef2025/no/neuraloperator/mig_project$ python train_inverse_fno.py
+>>> training BPC-FNO (inverse operator) on device: cuda
+volume: 32×32×16, sensors: 16×16=256
+train=3000, val=500
+loss = mse(J_pred, J_true) + λ * ||div(J_pred)||^2
+starting training...
+
+epoch 001 | train_loss=2.81e-04 | val_loss=2.52e-04 | mse=2.46e-04 | div=3.50e-05
+epoch 005 | train_loss=2.51e-04 | val_loss=2.52e-04 | mse=2.44e-04 | div=7.00e-06
+epoch 010 | train_loss=2.49e-04 | val_loss=2.50e-04 | mse=2.43e-04 | div=6.00e-06
+epoch 020 | train_loss=2.44e-04 | val_loss=2.46e-04 | mse=2.38e-04 | div=6.00e-06
+epoch 030 | train_loss=2.39e-04 | val_loss=2.41e-04 | mse=2.33e-04 | div=6.00e-06
+epoch 040 | train_loss=2.35e-04 | val_loss=2.38e-04 | mse=2.29e-04 | div=6.00e-06
+epoch 050 | train_loss=2.32e-04 | val_loss=2.35e-04 | mse=2.26e-04 | div=6.00e-06
+epoch 060 | train_loss=2.30e-04 | val_loss=2.33e-04 | mse=2.24e-04 | div=6.00e-06
+epoch 070 | train_loss=2.28e-04 | val_loss=2.31e-04 | mse=2.22e-04 | div=6.00e-06
+epoch 080 | train_loss=2.27e-04 | val_loss=2.30e-04 | mse=2.21e-04 | div=6.00e-06
+epoch 090 | train_loss=2.26e-04 | val_loss=2.29e-04 | mse=2.20e-04 | div=6.00e-06
+epoch 100 | train_loss=2.25e-04 | val_loss=2.28e-04 | mse=2.19e-04 | div=6.00e-06
+
+checkpoint saved: checkpoints/inverse_fno_epoch100.pt
+final: val_loss=2.28e-04 (stable generalization; low divergence penalty)
