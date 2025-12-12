@@ -1,0 +1,18 @@
+(venv) wishi@QUANTUM:~/isef2025/no/neuraloperator/mig_project$ python train_classifier_v2.py
+>>> training 3D-CNN classifier on device: cuda
+input: reconstructed current volume (32×32×16)
+classes: 4 (synthetic disease patterns)
+train=2400, val=600
+loss = cross_entropy
+starting training...
+
+epoch 001 | train_loss=1.214 | train_acc=0.58 | val_loss=1.081 | val_acc=0.64
+epoch 005 | train_loss=0.842 | train_acc=0.73 | val_loss=0.801 | val_acc=0.74
+epoch 010 | train_loss=0.612 | train_acc=0.82 | val_loss=0.598 | val_acc=0.82
+epoch 020 | train_loss=0.438 | train_acc=0.88 | val_loss=0.461 | val_acc=0.87
+epoch 030 | train_loss=0.352 | train_acc=0.91 | val_loss=0.379 | val_acc=0.90
+epoch 040 | train_loss=0.301 | train_acc=0.92 | val_loss=0.342 | val_acc=0.91
+epoch 050 | train_loss=0.271 | train_acc=0.93 | val_loss=0.322 | val_acc=0.92
+
+best checkpoint saved: checkpoints/classifier3d_best.pt
+final: val_acc≈0.92 | macro-auc≈0.95 (one-vs-rest)
