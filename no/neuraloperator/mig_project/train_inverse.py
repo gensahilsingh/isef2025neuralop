@@ -1,5 +1,4 @@
-# train_inverse.py
-print(">>> FILE LOADED")
+# train_inverse.py (balanced / sweet spot version)
 
 import torch
 from torch.utils.data import DataLoader
@@ -12,6 +11,8 @@ from losses import inverse_physics_loss
 
 
 def train_inverse():
+    print(">>> FILE LOADED")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("using device:", device)
 
@@ -21,8 +22,11 @@ def train_inverse():
     Nsx, Nsy = 16, 16
     sensor_offset = 0.01
 
-    n_train = 2000
-    n_val = 400
+    # GOOD SWEET SPOT: larger than original but not crazy heavy
+    n_train = 3000
+    n_val = 500
+
+    # batch_size=4 may work on 4060 Ti; if OOM, set to 2
     batch_size = 4
     noise_sigma = 0.05
 
@@ -32,7 +36,10 @@ def train_inverse():
         Nsx, Nsy, X, Y, Z, sensor_offset=sensor_offset, device=device
     )
 
-    # datasets
+    print(f"volume: {Nx}×{Ny}×{Nz}, sensors: {Nsx}×{Nsy}={Nsx*Nsy}")
+    print(f"train={n_train}, val={n_val}")
+
+    # dataset
     train_set = MIGInverseDataset(
         n_samples=n_train,
         Nx=Nx, Ny=Ny, Nz=Nz,
@@ -55,21 +62,25 @@ def train_inverse():
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
-    # model
+    # SWEET-SPOT MODEL SIZE (not too small, not too huge)
     model = MIGInverseModel(
         Nx=Nx, Ny=Ny, Nz=Nz,
         Hs=Nsx, Ws=Nsy,
-        latent_channels=16,
-        fno_width=32,
+        latent_channels=20,
+        fno_width=36,
         fno_layers=4,
-        modes_x=12,
-        modes_y=12,
-        modes_z=8
+        modes_x=12, modes_y=12, modes_z=8
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 
-    n_epochs = 50
+    # cosine schedule (good for smooth convergence)
+    n_epochs = 150
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-4
+    )
+
+    print("starting training...")
 
     for epoch in range(1, n_epochs + 1):
         model.train()
@@ -77,26 +88,28 @@ def train_inverse():
         n_train_samples = 0
 
         for batch in train_loader:
-            B = batch["B"].to(device)  # (b,3,Hs,Ws)
-            J_true = batch["J"].to(device)  # (b,3,Nx,Ny,Nz)
+            B = batch["B"].to(device)
+            J_true = batch["J"].to(device)
 
             optimizer.zero_grad()
 
             J_pred = model(B, X, Y, Z)
 
-            loss, parts = inverse_physics_loss(
+            loss, _ = inverse_physics_loss(
                 J_pred, J_true, B,
                 X, Y, Z, sensor_coords,
                 dx, dy, dz,
-                lambda_phys=0.1,
+                lambda_phys=0.12,  # slightly stronger than original
                 lambda_div=0.01
             )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             train_loss_sum += loss.item() * B.size(0)
             n_train_samples += B.size(0)
 
+        scheduler.step()
         train_loss = train_loss_sum / n_train_samples
 
         # validation
@@ -114,7 +127,7 @@ def train_inverse():
                     J_pred, J_true, B,
                     X, Y, Z, sensor_coords,
                     dx, dy, dz,
-                    lambda_phys=0.1,
+                    lambda_phys=0.12,
                     lambda_div=0.01
                 )
 
@@ -123,12 +136,16 @@ def train_inverse():
 
         val_loss = val_loss_sum / n_val_samples
 
-        print(f"epoch {epoch:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f}")
+        lr_current = scheduler.get_last_lr()[0]
 
-    # save model
-    torch.save(model.state_dict(), "mig_inverse_fno.pt")
-    print("saved model to mig_inverse_fno.pt")
+        print(
+            f"epoch {epoch:03d} | lr={lr_current:.5f} | "
+            f"train={train_loss:.5f} | val={val_loss:.5f}"
+        )
+
+    torch.save(model.state_dict(), "mig_inverse_fno_v2.pt")
+    print("saved model → mig_inverse_fno_v2.pt")
 
 
-if __name__ == "__main__"
+if __name__ == "__main__":
     train_inverse()

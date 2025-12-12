@@ -1,45 +1,60 @@
-# classifier3d.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class VoxelDiseaseClassifier3D(nn.Module):
-    """
-    3D CNN classifier:
-      Input: J voxel field (3,Nx,Ny,Nz)
-      Output: logits over disease classes.
-    """
-
-    def __init__(self, in_channels=3, num_classes=4, base_channels=16):
+class Classifier3D(nn.Module):
+    def __init__(self, num_classes=5):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv3d(base_channels, base_channels * 2, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv3d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1)
 
-        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
-        self.bn1 = nn.BatchNorm3d(base_channels)
-        self.bn2 = nn.BatchNorm3d(base_channels * 2)
-        self.bn3 = nn.BatchNorm3d(base_channels * 4)
+        self.features = nn.Sequential(
+            nn.Conv3d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(),
 
-        self.fc1 = nn.Linear(base_channels * 4, 64)
-        self.fc2 = nn.Linear(64, num_classes)
+            nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+            nn.MaxPool3d(2),   # 32→16, 32→16, 16→8
 
-    def forward(self, J):
-        """
-        J: (batch,3,Nx,Ny,Nz)
-        """
-        x = F.gelu(self.bn1(self.conv1(J)))
-        x = self.pool(x)
-        x = F.gelu(self.bn2(self.conv2(x)))
-        x = self.pool(x)
-        x = F.gelu(self.bn3(self.conv3(x)))
-        x = self.pool(x)  # shape: (b,C,D,H,W)
+            nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
 
-        # global average pooling
-        x = x.mean(dim=[2, 3, 4])  # (b,C)
+            nn.Conv3d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(),
+            nn.MaxPool3d(2),   # 16→8, 16→8, 8→4
+        )
 
-        x = F.gelu(self.fc1(x))
-        logits = self.fc2(x)
-        return logits
+        self.fc_in_dim = None
+        self.classifier_head = None
+        self.num_classes = num_classes
+
+    def build_head(self, x):
+        B = x.size(0)
+        x_flat = x.reshape(B, -1)
+        self.fc_in_dim = x_flat.size(1)
+
+        self.classifier_head = nn.Sequential(
+            nn.Linear(self.fc_in_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+
+            nn.Linear(256, self.num_classes)
+        ).to(x.device)
+
+    def forward(self, x):
+        x = self.features(x)
+
+        if self.classifier_head is None:
+            self.build_head(x)
+
+        B = x.size(0)
+        x = x.reshape(B, -1)  # reshape avoids non-contiguous errors
+
+        return self.classifier_head(x)

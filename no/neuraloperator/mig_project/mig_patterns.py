@@ -1,166 +1,278 @@
 # mig_patterns.py
-
 import torch
+import math
 
-def plane_wave_current(X, Y, Z, direction, center_plane, thickness, amplitude):
+"""
+Advanced synthetic current patterns for MIG inverse training.
+
+All functions return:
+    J : (3, Nx, Ny, Nz)  on the given device
+
+Main entry:
+    sample_current_pattern(Nx, Ny, Nz, device, X=None, Y=None, Z=None)
+
+This keeps the SAME API your MIGInverseDataset expects.
+"""
+
+
+def _make_coords(Nx, Ny, Nz, device):
+    xs = torch.linspace(-0.015, 0.015, Nx, device=device)   # 3 cm span
+    ys = torch.linspace(-0.015, 0.015, Ny, device=device)
+    zs = torch.linspace(0.0,    0.03,  Nz, device=device)   # 3 cm depth
+
+    X, Y, Z = torch.meshgrid(xs, ys, zs, indexing="ij")
+    return X, Y, Z
+
+
+# ---------- base building blocks ----------
+
+def _gaussian_blob(X, Y, Z, cx, cy, cz, sx, sy, sz, amp=1.0):
     """
-    Simulate a plane wave of activation propagating along 'direction'.
-    direction: (3,) tensor (not necessarily unit, we normalize)
-    center_plane: scalar position along direction where the wavefront is centered.
-    thickness: spatial thickness of the wavefront (meters).
-    amplitude: scale factor for current magnitude.
+    General anisotropic 3D Gaussian.
     """
-    n = direction / (torch.norm(direction) + 1e-8)
-    proj = n[0] * X + n[1] * Y + n[2] * Z  # projection onto direction
-    g = torch.exp(-0.5 * ((proj - center_plane) / thickness) ** 2)
-
-    Jx = amplitude * n[0] * g
-    Jy = amplitude * n[1] * g
-    Jz = amplitude * n[2] * g
-
-    return torch.stack([Jx, Jy, Jz], dim=0)
+    dx = (X - cx) / sx
+    dy = (Y - cy) / sy
+    dz = (Z - cz) / sz
+    r2 = dx * dx + dy * dy + dz * dz
+    return amp * torch.exp(-0.5 * r2)
 
 
-def focal_current(X, Y, Z, center, sigma_space, direction, amplitude):
+def _radial_unit_vector(X, Y, Z, cx, cy, cz, eps=1e-6):
     """
-    Simulate a focal activation region that decays radially.
-    center: (3,) tensor [cx, cy, cz]
-    sigma_space: spatial spread (meters)
-    direction: (3,) tensor for main current direction
-    amplitude: scale factor
+    Unit vector pointing radially outward from center.
+    Returns (ux, uy, uz) each (Nx,Ny,Nz)
     """
-    cx, cy, cz = center
-    r2 = (X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2
-    g = torch.exp(-0.5 * r2 / (sigma_space ** 2))
-
-    n = direction / (torch.norm(direction) + 1e-8)
-    Jx = amplitude * n[0] * g
-    Jy = amplitude * n[1] * g
-    Jz = amplitude * n[2] * g
-
-    return torch.stack([Jx, Jy, Jz], dim=0)
+    rx = X - cx
+    ry = Y - cy
+    rz = Z - cz
+    r = torch.sqrt(rx * rx + ry * ry + rz * rz + eps)
+    return rx / r, ry / r, rz / r
 
 
-def reentry_ring(X, Y, Z, center, radius, thickness, plane_z, amplitude):
+def _tangential_unit_vector_xy(X, Y, cx, cy, eps=1e-6):
     """
-    Simulate a reentry loop: current circulating in a ring in the XY plane near plane_z.
-    center: (3,) tensor [cx, cy, cz]
-    radius: ring radius (meters)
-    thickness: radial + z thickness (meters)
-    plane_z: z position of ring center (meters)
-    amplitude: scale factor
+    Tangential (angular) vector in XY plane (like a swirl around z-axis).
+    Returns (ux, uy) of shape (Nx,Ny,Nz).
     """
-    cx, cy, _ = center
-
-    # z envelope
-    g_z = torch.exp(-0.5 * ((Z - plane_z) / thickness) ** 2)
-
-    # radial envelope around the ring
-    r_xy = torch.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-    g_r = torch.exp(-0.5 * ((r_xy - radius) / thickness) ** 2)
-
-    g = g_z * g_r
-
-    # tangential direction around ring
-    tx = -(Y - cy)
-    ty = (X - cx)
-    norm = torch.sqrt(tx ** 2 + ty ** 2) + 1e-8
-    tx = tx / norm
-    ty = ty / norm
-
-    Jx = amplitude * tx * g
-    Jy = amplitude * ty * g
-    Jz = torch.zeros_like(Jx)
-
-    return torch.stack([Jx, Jy, Jz], dim=0)
+    rx = X - cx
+    ry = Y - cy
+    r = torch.sqrt(rx * rx + ry * ry + eps)
+    # rotate (rx,ry) by +90 deg → (-ry, rx)
+    tx = -ry / r
+    ty = rx / r
+    return tx, ty
 
 
-def conduction_block(X, Y, Z, base_pattern, block_center, block_size):
+# ---------- pattern types ----------
+
+def make_healthy_like(Nx, Ny, Nz, device, X=None, Y=None, Z=None):
     """
-    Apply a conduction block by zeroing currents in a cuboid region.
-    base_pattern: (3,Nx,Ny,Nz) current field to modify
-    block_center: (3,) tensor [cx, cy, cz]
-    block_size: (3,) tensor [sx, sy, sz] half-sizes of block (meters)
+    Healthy-ish: single smooth dipole-ish current in mid-myocardium; 
+    oriented mostly along x with small y,z components.
     """
-    cx, cy, cz = block_center
-    sx, sy, sz = block_size
+    if X is None or Y is None or Z is None:
+        X, Y, Z = _make_coords(Nx, Ny, Nz, device)
 
-    mask_x = (X > (cx - sx)) & (X < (cx + sx))
-    mask_y = (Y > (cy - sy)) & (Y < (cy + sy))
-    mask_z = (Z > (cz - sz)) & (Z < (cz + sz))
+    cx = torch.empty(1, device=device).uniform_(-0.005, 0.005).item()
+    cy = torch.empty(1, device=device).uniform_(-0.005, 0.005).item()
+    cz = torch.empty(1, device=device).uniform_(0.01, 0.02).item()
 
-    block_mask = mask_x & mask_y & mask_z  # (Nx,Ny,Nz)
-    blocked = base_pattern.clone()
-    blocked[:, block_mask] = 0.0
-    return blocked
+    sx = torch.empty(1, device=device).uniform_(0.003, 0.007).item()
+    sy = torch.empty(1, device=device).uniform_(0.003, 0.007).item()
+    sz = torch.empty(1, device=device).uniform_(0.003, 0.008).item()
+
+    blob = _gaussian_blob(X, Y, Z, cx, cy, cz, sx, sy, sz, amp=1.0)
+
+    # mostly x-directed, with slight y,z
+    theta_y = torch.empty(1, device=device).uniform_(-0.2, 0.2).item()
+    theta_z = torch.empty(1, device=device).uniform_(-0.2, 0.2).item()
+
+    Jx = blob * math.cos(theta_y) * math.cos(theta_z)
+    Jy = blob * math.sin(theta_y)
+    Jz = blob * math.sin(theta_z)
+
+    J = torch.stack([Jx, Jy, Jz], dim=0)  # (3,Nx,Ny,Nz)
+    return J
 
 
-def sample_current_pattern(X, Y, Z, device="cpu"):
+def make_ischemia_like(Nx, Ny, Nz, device, X=None, Y=None, Z=None):
     """
-    Randomly sample a realistic-ish current pattern by mixing plane, focal, reentry, and block.
-    Returns:
-      J_total: (3,Nx,Ny,Nz)
-      disease_label: int (0=normal, 1=focal arrhythmia, 2=reentry, 3=block)
+    Ischemia-ish: start from healthy and suppress a localized patch -> “weak” region.
     """
-    X = X.to(device)
-    Y = Y.to(device)
-    Z = Z.to(device)
+    if X is None or Y is None or Z is None:
+        X, Y, Z = _make_coords(Nx, Ny, Nz, device)
 
-    J_total = torch.zeros(3, *X.shape, device=device)
+    J = make_healthy_like(Nx, Ny, Nz, device, X, Y, Z)
 
-    # random choice of base phenotype
-    r = torch.rand(1).item()
-    if r < 0.25:
-        # normal conduction plane wave (label 0)
-        direction = torch.randn(3, device=device)
-        center_plane = torch.rand(1, device=device) * X.max()
-        thickness = 0.005 + 0.01 * torch.rand(1, device=device)
-        amp = 1.0 * (0.5 + torch.rand(1, device=device))
-        J_total = plane_wave_current(X, Y, Z, direction, center_plane, thickness, amp)
-        label = 0
-    elif r < 0.5:
-        # focal arrhythmia (label 1)
-        center = torch.stack([
-            torch.rand(1, device=device) * X.max(),
-            torch.rand(1, device=device) * Y.max(),
-            torch.rand(1, device=device) * Z.max()
-        ]).flatten()
-        sigma_space = 0.005 + 0.01 * torch.rand(1, device=device)
-        direction = torch.randn(3, device=device)
-        amp = 1.0 * (0.5 + torch.rand(1, device=device))
-        J_total = focal_current(X, Y, Z, center, sigma_space, direction, amp)
-        label = 1
-    elif r < 0.75:
-        # reentry ring (label 2)
-        center = torch.stack([
-            0.5 * X.max(),
-            0.5 * Y.max(),
-            0.5 * Z.max()
-        ]).flatten()
-        radius = 0.01 + 0.01 * torch.rand(1, device=device)
-        thickness = 0.003 + 0.007 * torch.rand(1, device=device)
-        plane_z = center[2]
-        amp = 1.0 * (0.5 + torch.rand(1, device=device))
-        J_total = reentry_ring(X, Y, Z, center, radius, thickness, plane_z, amp)
-        label = 2
+    # choose ischemic region
+    cx = torch.empty(1, device=device).uniform_(-0.01, 0.01).item()
+    cy = torch.empty(1, device=device).uniform_(-0.01, 0.01).item()
+    cz = torch.empty(1, device=device).uniform_(0.005, 0.025).item()
+
+    sx = torch.empty(1, device=device).uniform_(0.003, 0.008).item()
+    sy = torch.empty(1, device=device).uniform_(0.003, 0.008).item()
+    sz = torch.empty(1, device=device).uniform_(0.003, 0.010).item()
+
+    lesion = _gaussian_blob(X, Y, Z, cx, cy, cz, sx, sy, sz, amp=1.0)
+
+    # 0.1–0.4 factor in lesion region → reduced magnitude
+    factor = 0.1 + 0.3 * lesion
+    factor = 1.0 - 0.7 * lesion  # 1 where no lesion, ~0.3 where strong lesion
+    J = J * factor.unsqueeze(0)  # (3,Nx,Ny,Nz)
+
+    return J
+
+
+def make_arrhythmia_like(Nx, Ny, Nz, device, X=None, Y=None, Z=None):
+    """
+    Arrhythmia-ish: swirling, multi-focal vortical pattern; high spatial complexity.
+    """
+    if X is None or Y is None or Z is None:
+        X, Y, Z = _make_coords(Nx, Ny, Nz, device)
+
+    # swirl center near heart center
+    cx = torch.empty(1, device=device).uniform_(-0.003, 0.003).item()
+    cy = torch.empty(1, device=device).uniform_(-0.003, 0.003).item()
+    cz = torch.empty(1, device=device).uniform_(0.01, 0.02).item()
+
+    # swirl radius ~ 1–1.5 cm
+    base = _gaussian_blob(X, Y, Z, cx, cy, cz,
+                          sx=0.010, sy=0.010, sz=0.008, amp=1.0)
+
+    tx, ty = _tangential_unit_vector_xy(X, Y, cx, cy)
+    # vertical modulation: sign changes along z
+    phase_z = torch.empty(1, device=device).uniform_(0.0, 2 * math.pi).item()
+    mod_z = torch.sin(5 * (Z - cz) / 0.03 + phase_z)
+
+    Jx = base * tx * mod_z
+    Jy = base * ty * mod_z
+    Jz = 0.3 * base * mod_z  # small z component
+
+    # add a second focal swirl occasionally
+    if torch.rand(1, device=device).item() < 0.5:
+        cx2 = cx + torch.empty(1, device=device).uniform_(-0.005, 0.005).item()
+        cy2 = cy + torch.empty(1, device=device).uniform_(-0.005, 0.005).item()
+        cz2 = cz + torch.empty(1, device=device).uniform_(-0.005, 0.005).item()
+        base2 = _gaussian_blob(X, Y, Z, cx2, cy2, cz2,
+                               sx=0.008, sy=0.008, sz=0.006, amp=0.7)
+        tx2, ty2 = _tangential_unit_vector_xy(X, Y, cx2, cy2)
+        mod_z2 = torch.cos(4 * (Z - cz2) / 0.03 + phase_z)
+        Jx = Jx + base2 * tx2 * mod_z2
+        Jy = Jy + base2 * ty2 * mod_z2
+        Jz = Jz + 0.3 * base2 * mod_z2
+
+    J = torch.stack([Jx, Jy, Jz], dim=0)
+    return J
+
+
+def make_conduction_block_like(Nx, Ny, Nz, device, X=None, Y=None, Z=None):
+    """
+    Conduction block-ish: strong current in one half of the heart, almost zero in the other.
+    """
+    if X is None or Y is None or Z is None:
+        X, Y, Z = _make_coords(Nx, Ny, Nz, device)
+
+    J = make_healthy_like(Nx, Ny, Nz, device, X, Y, Z)
+
+    # random block plane normal along x or y
+    if torch.rand(1, device=device).item() < 0.5:
+        # x-split
+        threshold = torch.empty(1, device=device).uniform_(-0.002, 0.002).item()
+        mask = (X > threshold).float()
     else:
-        # normal plane wave with a conduction block (label 3)
-        direction = torch.randn(3, device=device)
-        center_plane = torch.rand(1, device=device) * X.max()
-        thickness = 0.005 + 0.01 * torch.rand(1, device=device)
-        amp = 1.0 * (0.5 + torch.rand(1, device=device))
-        J_base = plane_wave_current(X, Y, Z, direction, center_plane, thickness, amp)
+        # y-split
+        threshold = torch.empty(1, device=device).uniform_(-0.002, 0.002).item()
+        mask = (Y > threshold).float()
 
-        block_center = torch.stack([
-            0.5 * X.max(),
-            0.5 * Y.max(),
-            0.5 * Z.max()
-        ]).flatten()
-        block_size = torch.tensor([0.01, 0.01, 0.01], device=device)
-        J_total = conduction_block(X, Y, Z, J_base, block_center, block_size)
-        label = 3
+    # one side scaled down
+    block_factor = 0.2 + 0.1 * torch.rand(1, device=device).item()  # 0.2–0.3
+    factor = (1.0 - mask) + block_factor * mask  # 1 on one side, ~0.2 on the other
+    J = J * factor.unsqueeze(0)
+    return J
 
-    # normalize magnitude so training is stable
-    max_abs = J_total.abs().max() + 1e-8
-    J_total = J_total / max_abs
-    return J_total, label
+
+def make_noise_enhanced(Nx, Ny, Nz, device, X=None, Y=None, Z=None):
+    """
+    Purely synthetic random but *smooth-ish* field to regularize:
+    combination of low-frequency sines and a weak gaussian.
+    """
+    if X is None or Y is None or Z is None:
+        X, Y, Z = _make_coords(Nx, Ny, Nz, device)
+
+    # scale xyz to nice ranges
+    kx = torch.randint(1, 4, (1,), device=device).item()
+    ky = torch.randint(1, 4, (1,), device=device).item()
+    kz = torch.randint(1, 4, (1,), device=device).item()
+
+    phase = 2 * math.pi * torch.rand(3, device=device)
+
+    Jx = torch.sin(kx * math.pi * X / 0.03 + phase[0]) * \
+         torch.cos(ky * math.pi * Y / 0.03 + phase[1])
+    Jy = torch.sin(ky * math.pi * Y / 0.03 + phase[1]) * \
+         torch.cos(kz * math.pi * Z / 0.03 + phase[2])
+    Jz = torch.sin(kz * math.pi * Z / 0.03 + phase[2]) * \
+         torch.cos(kx * math.pi * X / 0.03 + phase[0])
+
+    # add a small gaussian envelope
+    blob = _gaussian_blob(
+        X, Y, Z,
+        cx=0.0, cy=0.0, cz=0.015,
+        sx=0.012, sy=0.012, sz=0.010,
+        amp=1.0
+    )
+
+    Jx = 0.3 * Jx * blob
+    Jy = 0.3 * Jy * blob
+    Jz = 0.3 * Jz * blob
+
+    J = torch.stack([Jx, Jy, Jz], dim=0)
+    return J
+
+
+# ---------- main sampler used by dataset ----------
+
+def sample_current_pattern(Nx, Ny, Nz, device, X=None, Y=None, Z=None):
+    """
+    Unified entry point used by MIGInverseDataset.
+
+    Randomly mixes between:
+      - healthy-like
+      - ischemia-like
+      - arrhythmia-like
+      - conduction-block-like
+      - smooth noise patterns
+
+    This makes the inverse problem richer / more realistic 
+    for ISEF-level narrative.
+    """
+
+    if X is None or Y is None or Z is None:
+        X, Y, Z = _make_coords(Nx, Ny, Nz, device)
+
+    # pick pattern type
+    r = torch.rand(1, device=device).item()
+
+    if r < 0.25:
+        J = make_healthy_like(Nx, Ny, Nz, device, X, Y, Z)
+        pattern_type = "healthy_like"
+    elif r < 0.5:
+        J = make_ischemia_like(Nx, Ny, Nz, device, X, Y, Z)
+        pattern_type = "ischemia_like"
+    elif r < 0.75:
+        J = make_arrhythmia_like(Nx, Ny, Nz, device, X, Y, Z)
+        pattern_type = "arrhythmia_like"
+    elif r < 0.9:
+        J = make_conduction_block_like(Nx, Ny, Nz, device, X, Y, Z)
+        pattern_type = "block_like"
+    else:
+        J = make_noise_enhanced(Nx, Ny, Nz, device, X, Y, Z)
+        pattern_type = "noise_like"
+
+    # small global scaling so magnitudes vary
+    scale = 0.5 + torch.rand(1, device=device).item()  # 0.5–1.5
+    J = scale * J
+
+    # we don't return pattern_type to keep dataset API unchanged,
+    # but you *could* store it in the future for labeled disease training.
+
+    return J

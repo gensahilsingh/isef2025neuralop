@@ -1,53 +1,121 @@
 # mig_forward.py
-
 import torch
 
-MU0 = 4e-7 * torch.pi  # magnetic constant μ0
+# ============================================================
+#  SENSOR GRID
+# ============================================================
 
-def flatten_volume_coords(X, Y, Z):
+def make_sensor_grid(Nsx=16, Nsy=16, device="cpu"):
     """
-    X,Y,Z: (Nx,Ny,Nz)
-    Returns coords: (Nv,3) where Nv = Nx*Ny*Nz
+    Returns a (Nsx*Nsy, 3) grid of sensor coordinates.
+    Grid spans ~8cm × 8cm square at z = 0.06 m.
     """
-    coords = torch.stack([X, Y, Z], dim=-1)  # (Nx,Ny,Nz,3)
-    return coords.view(-1, 3)
+    xs = torch.linspace(-0.04, 0.04, Nsx, device=device)
+    ys = torch.linspace(-0.04, 0.04, Nsy, device=device)
+    zs = torch.tensor([0.06], device=device)
+
+    X, Y, Z = torch.meshgrid(xs, ys, zs, indexing="ij")
+    coords = torch.stack([X, Y, Z], dim=-1).reshape(-1, 3)
+
+    return coords  # (256,3)
 
 
-def forward_biot_savart_sensors(J, X, Y, Z, sensor_coords, dx, dy, dz):
-    """
-    Compute B at each sensor due to current field J.
+# ============================================================
+#  BIOT–SAVART FORWARD MODEL
+# ============================================================
 
-    J: (3,Nx,Ny,Nz)
-    X,Y,Z: (Nx,Ny,Nz)
-    sensor_coords: (Ns,3)
-    dx,dy,dz: voxel sizes (meters)
-    Returns:
-      B_sensors: (Ns,3)
+def forward_biot_savart_sensors(J, sensor_coords):
     """
+    Compute B-field at sensors.
+
+    J:
+        (3,Nx,Ny,Nz) or (B,3,Nx,Ny,Nz)
+    sensor_coords:
+        (S,3)
+
+    RETURNS:
+        (B, S, 3)
+    """
+
+    # -----------------------------
+    # (1) enforce batch
+    # -----------------------------
+    if J.dim() == 4:
+        J = J.unsqueeze(0)
+
+    Bsz, C, Nx, Ny, Nz = J.shape
+    assert C == 3
+
+    S = sensor_coords.shape[0]
     device = J.device
-    dV = dx * dy * dz
 
-    # flatten
-    voxel_coords = flatten_volume_coords(X, Y, Z).to(device)   # (Nv,3)
-    J_flat = J.view(3, -1).transpose(0, 1)                     # (Nv,3)
-    sensor_coords = sensor_coords.to(device)                   # (Ns,3)
+    # -----------------------------
+    # (2) Flatten J → (B,P,3)
+    # -----------------------------
+    P = Nx * Ny * Nz
+    J_flat = J.reshape(Bsz, 3, P).permute(0, 2, 1)
+    assert J_flat.shape == (Bsz, P, 3)
 
-    Nv = voxel_coords.shape[0]
-    Ns = sensor_coords.shape[0]
+    # -----------------------------
+    # (3) voxel coords → (1,1,P,3)
+    # -----------------------------
+    xs = torch.linspace(-0.015, 0.015, Nx, device=device)
+    ys = torch.linspace(-0.015, 0.015, Ny, device=device)
+    zs = torch.linspace(0.00,  0.03, Nz, device=device)
 
-    # expand dims: rs (Ns,1,3), rj (1,Nv,3)
-    rs = sensor_coords.unsqueeze(1)            # (Ns,1,3)
-    rj = voxel_coords.unsqueeze(0)            # (1,Nv,3)
-    R = rs - rj                                # (Ns,Nv,3)
-    R_norm = torch.norm(R, dim=-1) + 1e-9     # (Ns,Nv)
+    X, Y, Z = torch.meshgrid(xs, ys, zs, indexing="ij")
+    vox = torch.stack([X, Y, Z], dim=-1).reshape(P, 3)
+    vox = vox.unsqueeze(0).unsqueeze(0)  # (1,1,P,3)
+    assert vox.shape == (1,1,P,3)
 
-    # J x R
-    Jv = J_flat.unsqueeze(0).expand(Ns, Nv, 3)  # (Ns,Nv,3)
-    JxR = torch.cross(Jv, R, dim=-1)            # (Ns,Nv,3)
+    # -----------------------------
+    # (4) sensor coords → (1,S,1,3)
+    # -----------------------------
+    sensors = sensor_coords.to(device).reshape(1, S, 1, 3)
+    assert sensors.shape == (1,S,1,3)
 
-    factor = MU0 / (4 * torch.pi)
-    coeff = factor * dV / (R_norm ** 3).unsqueeze(-1)   # (Ns,Nv,1)
-    contrib = coeff * JxR                               # (Ns,Nv,3)
+    # -----------------------------
+    # (5) r = sensor - voxel
+    # -----------------------------
+    r = sensors - vox          # (1,S,P,3)
+    dist = torch.norm(r, dim=-1) + 1e-6   # (1,S,P)
+    r_hat = r / dist.unsqueeze(-1)        # (1,S,P,3)
 
-    B = contrib.sum(dim=1)     # (Ns,3)
-    return B
+    # expand r_hat to B batch
+    r_hat = r_hat.expand(Bsz, S, P, 3)
+    assert r_hat.shape == (Bsz,S,P,3)
+
+    # -----------------------------
+    # (6) expand current
+    # -----------------------------
+    J_exp = J_flat.unsqueeze(1).expand(Bsz, S, P, 3)
+    assert J_exp.shape == (Bsz,S,P,3)
+
+    # -----------------------------
+    # (7) cross product
+    # -----------------------------
+    cross = torch.cross(J_exp, r_hat, dim=-1)
+    assert cross.shape == (Bsz,S,P,3)
+
+    # -----------------------------
+    # (8) denominator → expand to match cross
+    # -----------------------------
+    # dist: (1, S, P)
+    denom = (dist.unsqueeze(-1) ** 2)    # (1, S, P, 1)
+    denom = denom.expand(Bsz, S, P, 1)   # (B, S, P, 1)
+
+    assert denom.shape == (Bsz,S,P,1)
+
+    contrib = cross / denom
+    assert contrib.shape == (Bsz,S,P,3)
+
+    # -----------------------------
+    # (9) integrate over voxels
+    # -----------------------------
+    B_sensors = contrib.sum(dim=2)   # (B,S,3)
+    assert B_sensors.shape == (Bsz,S,3)
+    dV = (2*0.015 / Nx) * (2*0.015 / Ny) * (0.03 / Nz)  # or your dx,dy,dz exactly
+
+    B_sensors = contrib.sum(dim=2) * dV
+
+    return B_sensors
